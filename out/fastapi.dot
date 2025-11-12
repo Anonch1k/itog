@@ -1,0 +1,10 @@
+digraph deps {
+  rankdir=LR;
+  node [shape=box, style="rounded,filled", fillcolor="#f8f9fb", color="#9aa0a6", fontname="Arial"];
+  edge [color="#9aa0a6"];
+  labelloc="t"; label="FastAPI 0.110.0 deps"; fontsize=18;
+  "fastapi" [shape=box, fillcolor="#e8f0fe", color="#5f6368", penwidth=1.5];
+  "fastapi" -> "starlette";
+  "fastapi" -> "pydantic";
+  "fastapi" -> "typing-extensions";
+}

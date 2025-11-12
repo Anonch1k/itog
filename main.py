@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import ast
+import configparser
 import os
-import sys
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
-import configparser
-import ast
-from typing import Dict, List, Set, Tuple, Optional
 
-# tomllib — stdlib в Python 3.11+
+# tomllib — stdlib c Python 3.11+
 try:
     import tomllib  # type: ignore
 except Exception:
@@ -22,7 +22,7 @@ except Exception:
 
 REPO_MODE_CHOICES = ("clone", "local")
 
-# ========== утилиты/валидация ==========
+# -------------------- утилиты и валидация --------------------
 
 def eprint(msg: str):
     print(msg, file=sys.stderr)
@@ -54,8 +54,6 @@ def validate_repo_mode(mode: str) -> str:
         error(f"Режим репозитория должен быть одним из: {REPO_MODE_CHOICES}")
     return mode
 
-# ========== git ==========
-
 def is_git_url(s: str) -> bool:
     return s.endswith(".git") or s.startswith(("git@", "ssh://", "https://", "http://"))
 
@@ -70,19 +68,20 @@ def git_clone(repo_url: str, dest: Path) -> Path:
         error(f"git clone не удался: {ex.stderr.strip() or ex.stdout.strip()}")
     return dest
 
-def git_try_checkout_version(repo_dir: Path, package: str, version: str) -> None:
+def git_try_checkout_version(repo_dir: Path, package: str, version: Optional[str]) -> None:
+    if not version:
+        return
     candidates = [f"v{version}", version, f"{package}-{version}"]
     try:
         run_git(["fetch", "--tags"], cwd=repo_dir, check=False)
         for tag in candidates:
             run_git(["fetch", "origin", "tag", tag], cwd=repo_dir, check=False)
-        out = run_git(["tag", "--list"], cwd=repo_dir, check=False).stdout.splitlines()
-        existing = set(t.strip() for t in out if t.strip())
-        for tag in candidates:
-            if tag in existing:
-                run_git(["checkout", "--quiet", f"refs/tags/{tag}"], cwd=repo_dir, check=True)
+        tags = set(t.strip() for t in run_git(["tag", "--list"], cwd=repo_dir, check=False).stdout.splitlines())
+        for t in candidates:
+            if t in tags:
+                run_git(["checkout", "--quiet", f"refs/tags/{t}"], cwd=repo_dir, check=True)
                 return
-        # fallback: ветка с таким именем
+        # fallback: ветка
         for br in candidates:
             try:
                 run_git(["checkout", "--quiet", br], cwd=repo_dir, check=True)
@@ -92,7 +91,7 @@ def git_try_checkout_version(repo_dir: Path, package: str, version: str) -> None
     except Exception:
         pass
 
-# ========== парсинг зависимостей (как в Этапе 2/3) ==========
+# -------------------- парсинг зависимостей (как в этапах 2–4) --------------------
 
 def _normalize_lines(raw: str) -> List[str]:
     lines: List[str] = []
@@ -234,7 +233,7 @@ def read_declared_version(repo_root: Path) -> Optional[str]:
             pass
     return None
 
-# ========== тестовый режим: парсер текстового графа A..Z ==========
+# -------------------- тестовый граф A..Z --------------------
 
 def parse_test_graph(path: Path) -> Dict[str, List[str]]:
     if not path.is_file():
@@ -264,7 +263,7 @@ def parse_test_graph(path: Path) -> Dict[str, List[str]]:
             graph.setdefault(v, [])
     return graph
 
-# ========== карта репозиториев зависимостей (для real-режима) ==========
+# -------------------- карта репозиториев для транзитивного real-режима --------------------
 
 def load_deps_map(path: Optional[str]) -> Dict[str, str]:
     if not path:
@@ -285,21 +284,21 @@ def load_deps_map(path: Optional[str]) -> Dict[str, str]:
             mapping[name.lower()] = loc
     return mapping
 
-# ========== построение графа DFS с глубиной и циклами ==========
+# -------------------- построение графа (DFS, циклы) --------------------
 
 def _norm_name(spec: str) -> str:
+    # "pydantic>=2.0.0; python_version >= '3.8'" -> "pydantic"
     return re.split(r"[<>=!;\[\s]", spec, maxsplit=1)[0].strip()
 
 class GraphBuilder:
-    def __init__(self, max_depth: int, deps_map: Dict[str, str],
-                 version: Optional[str], keep_clones: bool = False):
+    def __init__(self, max_depth: int, deps_map: Dict[str, str], version: Optional[str], keep_clones: bool = False):
         self.max_depth = max_depth
         self.deps_map = deps_map
         self.version = version
         self.keep_clones = keep_clones
         self.tmpdirs: List[Path] = []
         self.graph: Dict[str, List[str]] = {}
-        self._resolved_cache: Dict[str, List[str]] = {}
+        self._cache: Dict[str, List[str]] = {}
 
     def _cleanup(self):
         if self.keep_clones:
@@ -309,10 +308,10 @@ class GraphBuilder:
 
     def _resolve_pkg_deps(self, pkg: str) -> List[str]:
         key = pkg.lower()
-        if key in self._resolved_cache:
-            return self._resolved_cache[key]
+        if key in self._cache:
+            return self._cache[key]
         if key not in self.deps_map:
-            self._resolved_cache[key] = []
+            self._cache[key] = []
             return []
         loc = self.deps_map[key]
         if is_git_url(loc):
@@ -320,26 +319,24 @@ class GraphBuilder:
             self.tmpdirs.append(work)
             root = work / "repo"
             git_clone(loc, root)
-            if self.version:
-                git_try_checkout_version(root, pkg, self.version)
-            deps = extract_runtime_dependencies(root)
+            git_try_checkout_version(root, pkg, self.version)
+            specs = extract_runtime_dependencies(root)
         else:
-            root = Path(loc).resolve()
+            root = Path(loc)
             if not root.is_dir():
                 eprint(f"Предупреждение: путь '{loc}' для '{pkg}' недоступен.")
-                deps = []
+                specs = []
             else:
-                deps = extract_runtime_dependencies(root)
+                specs = extract_runtime_dependencies(root)
         names = []
-        for spec in deps:
+        for spec in specs:
             nm = _norm_name(spec)
             if nm:
                 names.append(nm)
-        self._resolved_cache[key] = names
+        self._cache[key] = names
         return names
 
-    def dfs(self, node: str, depth: int, visit: Set[str], stack: List[str],
-            cycles: List[List[str]], resolver_mode: str):
+    def dfs(self, node: str, depth: int, visit: Set[str], stack: List[str], cycles: List[List[str]], mode: str):
         if depth > self.max_depth:
             return
         if node in visit:
@@ -347,7 +344,7 @@ class GraphBuilder:
         visit.add(node)
         stack.append(node)
 
-        if resolver_mode == "test":
+        if mode == "test":
             neighbors = self.graph.get(node, [])
         else:
             neighbors = self._resolve_pkg_deps(node)
@@ -357,12 +354,10 @@ class GraphBuilder:
             if v not in self.graph[node]:
                 self.graph[node].append(v)
             if v not in visit:
-                self.dfs(v, depth + 1, visit, stack, cycles, resolver_mode)
+                self.dfs(v, depth + 1, visit, stack, cycles, mode)
             elif v in stack:
-                # цикл: извлечём путь
                 i = stack.index(v)
-                cyc = stack[i:] + [v]
-                cycles.append(cyc)
+                cycles.append(stack[i:] + [v])
 
         stack.pop()
 
@@ -384,204 +379,116 @@ class GraphBuilder:
         self.dfs(root_pkg, 0, set(), [], cycles, "real")
         return self.graph, cycles
 
-# ========== операции над графом: печать, топосорт, порядок загрузки ==========
+# -------------------- SCC (Таръян) для подсветки циклов --------------------
 
-def print_graph(graph: Dict[str, List[str]]):
-    for u, vs in graph.items():
-        if not vs:
-            print(f"{u}:")
-        else:
-            print(f"{u}: " + " ".join(vs))
-
-def topo_sort(graph: Dict[str, List[str]]) -> Optional[List[str]]:
-    indeg: Dict[str, int] = {}
-    for u in graph:
-        indeg.setdefault(u, 0)
-        for v in graph[u]:
-            indeg[v] = indeg.get(v, 0) + 1
-    queue = [u for u, d in indeg.items() if d == 0]
-    order: List[str] = []
-    gcopy = {u: list(vs) for u, vs in graph.items()}
-    while queue:
-        u = queue.pop(0)
-        order.append(u)
-        for v in gcopy.get(u, []):
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                queue.append(v)
-        gcopy[u] = []
-    if any(d > 0 for d in indeg.values()):
-        return None
-    return order
-
-# ---- Таръян: СКС ----
 def tarjans_scc(graph: Dict[str, List[str]]) -> List[List[str]]:
     index = 0
     indices: Dict[str, int] = {}
-    lowlink: Dict[str, int] = {}
-    stack: List[str] = []
-    onstack: Set[str] = set()
-    sccs: List[List[str]] = []
+    low: Dict[str, int] = {}
+    st: List[str] = []
+    onst: Set[str] = set()
+    comps: List[List[str]] = []
 
-    sys.setrecursionlimit(max(10000, len(graph) * 2))
+    sys.setrecursionlimit(max(8192, len(graph) * 4))
 
-    def strongconnect(v: str):
+    def sc(v: str):
         nonlocal index
-        indices[v] = index
-        lowlink[v] = index
+        indices[v] = low[v] = index
         index += 1
-        stack.append(v)
-        onstack.add(v)
-
+        st.append(v)
+        onst.add(v)
         for w in graph.get(v, []):
             if w not in indices:
-                strongconnect(w)
-                lowlink[v] = min(lowlink[v], lowlink[w])
-            elif w in onstack:
-                lowlink[v] = min(lowlink[v], indices[w])
-
-        # корень СКС?
-        if lowlink[v] == indices[v]:
-            comp: List[str] = []
+                sc(w)
+                low[v] = min(low[v], low[w])
+            elif w in onst:
+                low[v] = min(low[v], indices[w])
+        if low[v] == indices[v]:
+            comp = []
             while True:
-                w = stack.pop()
-                onstack.remove(w)
+                w = st.pop()
+                onst.remove(w)
                 comp.append(w)
                 if w == v:
                     break
-            sccs.append(comp)
+            comps.append(comp)
 
     for v in list(graph.keys()):
         if v not in indices:
-            strongconnect(v)
-    return sccs
+            sc(v)
+    return comps
 
-def condense_graph(graph: Dict[str, List[str]], sccs: List[List[str]]) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
-    comp_id: Dict[str, int] = {}
+# -------------------- экспорт в DOT и рендер в SVG --------------------
+
+def _dot_id(s: str) -> str:
+    # безопасный идентификатор: в DOT лучше использовать в кавычках label и идентификатор одинаково
+    return '"' + s.replace('"', '\\"') + '"'
+
+def graph_to_dot(graph: Dict[str, List[str]],
+                 root: str,
+                 sccs: List[List[str]],
+                 rankdir: str = "LR",
+                 title: Optional[str] = None) -> str:
+    # Индексация узлов по СКС
+    scc_by_node: Dict[str, int] = {}
     for i, comp in enumerate(sccs):
         for v in comp:
-            comp_id[v] = i
-    dag: Dict[int, List[int]] = {i: [] for i in range(len(sccs))}
+            scc_by_node[v] = i
+
+    lines: List[str] = []
+    lines.append("digraph deps {")
+    lines.append(f'  rankdir={rankdir};')
+    lines.append('  node [shape=box, style="rounded,filled", fillcolor="#f8f9fb", color="#9aa0a6", fontname="Arial"];')
+    lines.append('  edge [color="#9aa0a6"];')
+    if title:
+        lines.append(f'  labelloc="t"; label={_dot_id(title)}; fontsize=18;')
+
+    # Подсветка корня
+    lines.append(f'  {_dot_id(root)} [shape=box, fillcolor="#e8f0fe", color="#5f6368", penwidth=1.5];')
+
+    # Рёбра
     for u, vs in graph.items():
-        cu = comp_id[u]
-        for v in vs:
-            cv = comp_id[v]
-            if cu != cv and cv not in dag[cu]:
-                dag[cu].append(cv)
-    return dag, comp_id
-
-def load_order(graph: Dict[str, List[str]], root: str) -> List[str]:
-    """
-    Порядок загрузки «листья -> ... -> корень».
-    Если граф ацикличен — это просто топосорт подграфа, ограниченного достижимыми из root,
-    и развернутый так, что зависимости идут раньше.
-    Если есть циклы — печатаем СКС блоками вида [A B], считая, что эти узлы требуют
-    совместной загрузки/разрешения.
-    """
-    # ограничим граф достижимыми из root
-    reachable: Set[str] = set()
-    def _dfs(u: str):
-        if u in reachable:
-            return
-        reachable.add(u)
-        for v in graph.get(u, []):
-            _dfs(v)
-    _dfs(root)
-    sub = {u: [v for v in graph.get(u, []) if v in reachable] for u in reachable}
-
-    # СКС
-    sccs = tarjans_scc(sub)
-    if len(sccs) == len(sub):  # ацикличен
-        order = topo_sort(sub)
-        return order if order else []
-
-    dag, comp_id = condense_graph(sub, sccs)
-    topo_comps = topo_sort({i: dag.get(i, []) for i in dag}) or []
-    # в порядке топосорта компонент расширяем: внутри СКС сохраним детерминированность (лекс. порядок)
-    result: List[str] = []
-    for cid in topo_comps:
-        comp = sccs[cid]
-        if len(comp) == 1:
-            result.append(comp[0])
+        if not vs:
+            # одиночный узел
+            lines.append(f'  {_dot_id(u)};')
         else:
-            # пометим группу циклом
-            group = "[" + " ".join(sorted(comp)) + "]"
-            result.append(group)
-    return result
+            for v in vs:
+                lines.append(f'  {_dot_id(u)} -> {_dot_id(v)};')
 
-# ========== сравнение с pip (по запросу) ==========
-
-def pip_install_order(package: str, version: Optional[str]) -> List[str]:
-    """
-    Пытается получить порядок установки pip через --dry-run.
-    Требует интернет/доступ к индексам.
-    Возвращает имена пакетов (без версий).
-    """
-    spec = package if not version else f"{package}=={version}"
-    # --ignore-installed чтобы не влияли локальные пакеты
-    cmd = [sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed", spec]
-    try:
-        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-        out = cp.stdout.splitlines()
-        collected = None
-        for i, line in enumerate(out):
-            # Ищем финальную строку вида "Installing collected packages: A, B, C"
-            if "Installing collected packages:" in line:
-                collected = line
-        if not collected:
-            return []
-        after_colon = collected.split("Installing collected packages:", 1)[1]
-        # разделение по ", " с обрезкой версий "name (x.y.z)" -> name
-        parts = [p.strip() for p in after_colon.split(",")]
-        names: List[str] = []
-        for p in parts:
-            if not p:
-                continue
-            # возможные форматы: "pydantic", "pydantic (2.6.3)"
-            nm = p.split("(", 1)[0].strip()
-            names.append(nm)
-        # pip печатает порядок «зависимости раньше зависящего»
-        return names
-    except Exception:
-        return []
-
-def diff_orders(ours: List[str], pips: List[str]) -> Tuple[List[str], List[str], Optional[Tuple[int, str, str]]]:
-    """
-    Возвращает:
-      - only_ours: узлы, которых нет у pip
-      - only_pip: узлы, которых нет у нас
-      - first_mismatch: (позиция, ours_item, pip_item) либо None
-    """
-    # уберём групповые [A B] как цельные токены
-    ours_flat = ours[:]
-    pset = set(pips)
-    oset = set(ours_flat)
-
-    only_ours = [x for x in ours_flat if x.strip("[]") not in pset]
-    only_pip = [x for x in pips if x not in oset and f"[{x}]" not in oset]
-
-    # найдём первую позицию, где различается относительный порядок общих элементов
-    commons = [x for x in pips if x in oset or f"[{x}]" in oset]
-    oi = {x.strip("[]"): i for i, x in enumerate(ours_flat)}
-    for i, x in enumerate(commons):
-        y = commons[i]
-        j = oi.get(y, None)
-        if j is None:
+    # Кластеры для СКС (циклы): только если размер > 1
+    for i, comp in enumerate(sccs):
+        if len(comp) <= 1:
             continue
-        # ищем следующий общий элемент и сравниваем относительный порядок
-        if i + 1 < len(commons):
-            y2 = commons[i + 1]
-            j2 = oi.get(y2, None)
-            if j2 is not None and not (j < j2):
-                return (only_ours, only_pip, (i, y, y2))
-    return (only_ours, only_pip, None)
+        lines.append(f'  subgraph cluster_scc_{i} {{')
+        lines.append('    style="rounded,dashed"; color="#d93025"; label="cycle"; fontsize=10;')
+        for v in comp:
+            lines.append(f'    {_dot_id(v)} [fillcolor="#fdecea", color="#d93025"];')
+        lines.append('  }')
 
-# ========== CLI ==========
+    lines.append("}")
+    return "\n".join(lines)
+
+def write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+def render_svg(dot_path: Path, svg_path: Path) -> bool:
+    try:
+        cp = subprocess.run(["dot", "-Kdot", "-Tsvg", str(dot_path), "-o", str(svg_path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if cp.returncode != 0:
+            eprint("Graphviz 'dot' вернул ошибку:\n" + (cp.stderr or cp.stdout))
+            return False
+        return True
+    except FileNotFoundError:
+        eprint("Не найден исполняемый файл 'dot'. Установите Graphviz (например, `sudo apt-get install graphviz`).")
+        return False
+
+# -------------------- CLI --------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Этап 4: дополнительные операции над графом зависимостей. "
-                    "Порядок загрузки, сравнение с pip, тестовый режим."
+        description="Этап 5: визуализация графа зависимостей в Graphviz DOT и SVG."
     )
     # тестовый режим
     ap.add_argument("--test-graph", help="Файл тестового графа (узлы — A..Z). Включает тестовый режим.")
@@ -593,17 +500,16 @@ def main():
     ap.add_argument("--repo-mode", "-m", choices=REPO_MODE_CHOICES, help="clone|local (реальный режим).")
     ap.add_argument("--version", "-V", help="Версия корневого пакета (попытка checkout соответствующего тега).")
 
-    # карта зависимостей для рекурсии
-    ap.add_argument("--deps-map", help="Файл карты: 'name <space> url_or_path' для зависимостей.")
+    # карта зависимостей
+    ap.add_argument("--deps-map", help="Файл карты зависимостей: 'name URL_or_path'. Для транзитивности в реальном режиме.")
     ap.add_argument("--keep-clones", action="store_true", help="Не удалять временные клоны зависимостей (отладка).")
 
-    # операции
+    # настройки графа/вывода
     ap.add_argument("--max-depth", "-d", type=int, default=10, help="Максимальная глубина DFS (включая корень).")
-    ap.add_argument("--print-graph", action="store_true", help="Печать списка смежности.")
-    ap.add_argument("--print-cycles", action="store_true", help="Поиск и печать циклов.")
-    ap.add_argument("--toposort", action="store_true", help="Печать топологической сортировки (если без циклов).")
-    ap.add_argument("--load-order", action="store_true", help="Печать порядка загрузки зависимостей (листья -> корень).")
-    ap.add_argument("--compare-with-pip", action="store_true", help="Сравнить порядок с pip --dry-run (только реальный режим).")
+    ap.add_argument("--rankdir", choices=("LR", "TB", "BT", "RL"), default="LR", help="Ориентация графа.")
+    ap.add_argument("--dot-out", required=True, help="Куда сохранить DOT (.dot).")
+    ap.add_argument("--svg-out", required=True, help="Куда сохранить SVG (.svg).")
+    ap.add_argument("--title", help="Заголовок диаграммы (опционально).")
 
     ns = ap.parse_args()
 
@@ -614,26 +520,17 @@ def main():
         if root not in tg:
             error(f"Узел '{root}' отсутствует в тестовом графе.")
         builder = GraphBuilder(max_depth=ns.max_depth, deps_map={}, version=None, keep_clones=False)
-        graph, cycles = builder.build_from_test(tg, root)
-
-        if ns.print_graph:
-            print_graph(graph)
-        if ns.print_cycles:
-            for cyc in cycles:
-                print("CYCLE:", " -> ".join(cyc))
-        if ns.toposort:
-            order = topo_sort(graph)
-            print("TOPO:" if order else "TOPO: невозможно — граф содержит цикл.", end="")
-            if order:
-                print(" " + " ".join(order))
-            else:
-                print()
-        if ns.load_order:
-            lo = load_order(graph, root)
-            print("LOAD-ORDER:", " ".join(lo))
-        if not (ns.print_graph or ns.print_cycles or ns.toposort or ns.load_order):
-            lo = load_order(graph, root)
-            print("LOAD-ORDER:", " ".join(lo))
+        graph, _cycles = builder.build_from_test(tg, root)
+        sccs = tarjans_scc(graph)
+        title = ns.title or f"Test Graph (root={root})"
+        dot = graph_to_dot(graph, root, sccs, rankdir=ns.rankdir, title=title)
+        dot_path = Path(ns.dot_out)
+        svg_path = Path(ns.svg_out)
+        write_text(dot_path, dot)
+        ok = render_svg(dot_path, svg_path)
+        if ok:
+            print(f"DOT: {dot_path}")
+            print(f"SVG: {svg_path}")
         return
 
     # ---- реальный режим ----
@@ -642,23 +539,21 @@ def main():
 
     package = validate_package(ns.package)
     repo_arg = validate_repo(ns.repo)
-    mode = validate_repo_mode(ns.repo_mode)
-
-    deps_map = load_deps_map(ns.deps_map)
+    repo_mode = validate_repo_mode(ns.repo_mode)
+    deps_map = load_deps_map(ns.deps_map) if ns.deps_map else {}
     builder = GraphBuilder(max_depth=ns.max_depth, deps_map=deps_map, version=ns.version, keep_clones=ns.keep_clones)
 
     workdir: Optional[Path] = None
     repo_root: Optional[Path] = None
 
     try:
-        if mode == "clone":
+        if repo_mode == "clone":
             if not is_git_url(repo_arg):
                 error("Для режима clone ожидается git-URL.")
-            workdir = Path(tempfile.mkdtemp(prefix="stage4_"))
+            workdir = Path(tempfile.mkdtemp(prefix="stage5_"))
             repo_root = workdir / "rootrepo"
             git_clone(repo_arg, repo_root)
-            if ns.version:
-                git_try_checkout_version(repo_root, package, ns.version)
+            git_try_checkout_version(repo_root, package, ns.version)
         else:
             p = Path(repo_arg)
             if not p.is_dir():
@@ -669,49 +564,18 @@ def main():
         if declared_ver and ns.version and declared_ver != ns.version:
             eprint(f"Предупреждение: версия в репо = {declared_ver}, а запрошена = {ns.version}.")
 
-        graph, cycles = builder.build_from_real(repo_root, package)
+        graph, _cycles = builder.build_from_real(repo_root, package)
+        sccs = tarjans_scc(graph)
+        title = ns.title or (f"{package} dependencies" + (f" (v{ns.version})" if ns.version else ""))
 
-        if ns.print_graph:
-            print_graph(graph)
-        if ns.print_cycles:
-            for cyc in cycles:
-                print("CYCLE:", " -> ".join(cyc))
-        if ns.toposort:
-            order = topo_sort(graph)
-            print("TOPO:" if order else "TOPO: невозможно — граф содержит цикл.", end="")
-            if order:
-                print(" " + " ".join(order))
-            else:
-                print()
-
-        if ns.load_order or (not (ns.print_graph or ns.print_cycles or ns.toposort)):
-            lo = load_order(graph, package)
-            print("LOAD-ORDER:", " ".join(lo))
-
-        if ns.compare_with_pip:
-            if not ns.version:
-                eprint("Предупреждение: для сравнения с pip лучше указать --version.")
-            pip_order = pip_install_order(package, ns.version)
-            if not pip_order:
-                print("PIP-ORDER: (не удалось получить порядок; проверьте интернет/индексы)")
-            else:
-                print("PIP-ORDER:", " ".join(pip_order))
-                only_ours, only_pip, mismatch = diff_orders(lo, pip_order)
-                if only_ours:
-                    print("ONLY-OURS:", " ".join(only_ours))
-                if only_pip:
-                    print("ONLY-PIP:", " ".join(only_pip))
-                if mismatch:
-                    pos, a, b = mismatch
-                    print(f"MISMATCH@{pos}: порядок различается около '{a}' vs '{b}'")
-
-                # краткое объяснение возможных расхождений:
-                print("# NOTE: Возможные причины расхождений с pip:")
-                print("# - условные маркеры/экстры (например, 'platform_system == \"Windows\"') — мы их не вычисляем;")
-                print("# - неполная карта --deps-map (мы не заходили в репозитории некоторых зависимостей);")
-                print("# - различия версий/решения конфликтов у pip (бек-трекинг, выбор подходящих версий);")
-                print("# - динамическая генерация install_requires в setup.py;")
-                print("# - ограничение --max-depth.")
+        dot = graph_to_dot(graph, package, sccs, rankdir=ns.rankdir, title=title)
+        dot_path = Path(ns.dot_out)
+        svg_path = Path(ns.svg_out)
+        write_text(dot_path, dot)
+        ok = render_svg(dot_path, svg_path)
+        if ok:
+            print(f"DOT: {dot_path}")
+            print(f"SVG: {svg_path}")
     finally:
         if workdir and workdir.exists():
             shutil.rmtree(workdir, ignore_errors=True)
