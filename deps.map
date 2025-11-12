@@ -1,0 +1,2 @@
+starlette https://github.com/encode/starlette.git
+pydantic https://github.com/pydantic/pydantic.git

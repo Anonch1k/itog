@@ -1,0 +1,10 @@
+3 этап
+
+запуск с библиотеками
+
+python main.py -p fastapi -r https://github.com/fastapi/fastapi.git -m clone -V 0.110.0 \
+  --deps-map deps.map --max-depth 2 --print-graph --print-cycles --toposort --root fastapi
+
+запуск из файла 
+
+python main.py --test-graph test.txt --max-depth 5 --print-graph --print-cycles --toposort --root A
